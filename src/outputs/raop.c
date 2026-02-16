@@ -3065,7 +3065,7 @@ packets_sync_send(struct raop_master_session *rms)
       // A device has joined and should get an init sync packet
       if (rs->state == RAOP_STATE_CONNECTED)
 	{
-	  sync_pkt = rtp_sync_packet_next(rms->rtp_session, cur_stamp, 0x90);
+	  sync_pkt = rtp_sync_packet_next(rms->rtp_session, cur_stamp, 0x90, false);
 	  control_packet_send(rs, sync_pkt);
 
 	  DPRINTF(E_DBG, L_RAOP, "Start sync packet sent to '%s': offset=%d, cur_pos=%" PRIu32 ", cur_ts=%ld.%09ld, clock=%ld.%09ld, rtptime=%" PRIu32 "\n",
@@ -3073,7 +3073,7 @@ packets_sync_send(struct raop_master_session *rms)
 	}
       else if (is_sync_time && rs->state == RAOP_STATE_STREAMING)
 	{
-	  sync_pkt = rtp_sync_packet_next(rms->rtp_session, cur_stamp, 0x80);
+	  sync_pkt = rtp_sync_packet_next(rms->rtp_session, cur_stamp, 0x80, false);
 	  control_packet_send(rs, sync_pkt);
 	}
     }

@@ -104,13 +104,12 @@ struct rtp_session
   int sync_counter;
   struct rtp_packet sync_packet_next;
 
-  // For PTP
-  uint64_t clock_id;
+  uint64_t ptp_clock_id;
 };
 
 
 struct rtp_session *
-rtp_session_new(struct media_quality *quality, int pktbuf_size, int sync_each_nsamples, uint64_t clock_id);
+rtp_session_new(struct media_quality *quality, int pktbuf_size, int sync_each_nsamples, uint64_t ptp_clock_id);
 
 void
 rtp_session_free(struct rtp_session *session);
@@ -155,7 +154,7 @@ bool
 rtp_sync_is_time(struct rtp_session *session);
 
 struct rtp_packet *
-rtp_sync_packet_next(struct rtp_session *session, struct rtcp_timestamp cur_stamp, char type);
+rtp_sync_packet_next(struct rtp_session *session, struct rtcp_timestamp cur_stamp, char type, bool use_ptp);
 
 int
 rtcp_packet_parse(struct rtcp_packet *pkt, uint8_t *data, size_t size);
