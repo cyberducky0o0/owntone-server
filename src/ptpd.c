@@ -33,6 +33,7 @@
 
 #include "misc.h"
 #include "logger.h"
+#include "commands.h"
 
 #define PTPD_EVENT_PORT 319
 #define PTPD_GENERAL_PORT 320
@@ -51,10 +52,7 @@
 #define PTPD_INTERVAL_MS_SIGNALING 1000
 #define PTPD_LOGMESSAGEINT_DELAY_RESP -3
 
-#define PTPD_MAX_SLAVES 10
-
-// Just value chosen to not conflict with EV_xxx values
-#define PTPD_EVFLAG_NEW_SLAVE 0x99
+#define PTPD_MAX_SLAVES 32
 
 // Debugging
 #define PTPD_LOG_RECEIVED 0
@@ -62,39 +60,38 @@
 
 /* ============================= PTP definitions ============================ */
 
-// TODO enum?
-#define PTP_MSGTYPE_SYNC 0x00
-#define PTP_MSGTYPE_DELAY_REQ 0x01
-#define PTP_MSGTYPE_PDELAY_REQ 0x02
-#define PTP_MSGTYPE_PDELAY_RESP 0x03
-#define PTP_MSGTYPE_FOLLOW_UP 0x08
-#define PTP_MSGTYPE_DELAY_RESP 0x09
-#define PTP_MSGTYPE_PDELAY_RESP_FOLLOW_UP 0x0A
-#define PTP_MSGTYPE_ANNOUNCE 0x0B
-#define PTP_MSGTYPE_SIGNALING 0x0C
-#define PTP_MSGTYPE_MANAGEMENT 0x0D // Not implemented
-
 #define PTP_PORT_ID_SIZE 10
 
-#define PTP_TLV_ORG_EXTENSION 0x0003
-#define PTP_TLV_PATH_TRACE 0x0008
+enum ptp_msgtype
+{
+  PTP_MSGTYPE_SYNC = 0x00,
+  PTP_MSGTYPE_DELAY_REQ = 0x01,
+  PTP_MSGTYPE_PDELAY_REQ = 0x02,
+  PTP_MSGTYPE_PDELAY_RESP = 0x03,
+  PTP_MSGTYPE_FOLLOW_UP = 0x08,
+  PTP_MSGTYPE_DELAY_RESP = 0x09,
+  PTP_MSGTYPE_PDELAY_RESP_FOLLOW_UP = 0x0A,
+  PTP_MSGTYPE_ANNOUNCE = 0x0B,
+  PTP_MSGTYPE_SIGNALING = 0x0C,
+  PTP_MSGTYPE_MANAGEMENT = 0x0D,
+};
 
-// From Wireshark, doesn't seem to be in IEEE1588-2008, maybe from v1?
+// From Wireshark, doesn't seem to be in IEEE1588-2008, maybe its in ptp v1?
 enum ptp_flag
 {
-  PTP_FLAG_SECURITY = (1 << 15),
-  PTP_FLAG_PROFILE_SPECIFIC1 = (1 << 14),
-  PTP_FLAG_PROFILE_SPECIFIC2 = (1 << 13),
-  PTP_FLAG_UNICAST = (1 << 10),
-  PTP_FLAG_TWO_STEP = (1 << 9),
-  PTP_FLAG_ALTERNATE_MASTER = (1 << 8),
-  PTP_FLAG_SYNCRONIZATION_UNCERTAIN = (1 << 6),
-  PTP_FLAG_FREQUENCY_TRACEABLE = (1 << 5),
-  PTP_FLAG_TIME_TRACEABLE = (1 << 4),
-  PTP_FLAG_TIMESCALE = (1 << 3),
-  PTP_FLAG_UTC_UNREASONABLE = (1 << 2),
-  PTP_FLAG_LI_59 = (1 << 1),
   PTP_FLAG_LI_61 = (1 << 0),
+  PTP_FLAG_LI_59 = (1 << 1),
+  PTP_FLAG_UTC_UNREASONABLE = (1 << 2),
+  PTP_FLAG_TIMESCALE = (1 << 3),
+  PTP_FLAG_TIME_TRACEABLE = (1 << 4),
+  PTP_FLAG_FREQUENCY_TRACEABLE = (1 << 5),
+  PTP_FLAG_SYNCRONIZATION_UNCERTAIN = (1 << 6),
+  PTP_FLAG_ALTERNATE_MASTER = (1 << 8),
+  PTP_FLAG_TWO_STEP = (1 << 9),
+  PTP_FLAG_UNICAST = (1 << 10),
+  PTP_FLAG_PROFILE_SPECIFIC2 = (1 << 13),
+  PTP_FLAG_PROFILE_SPECIFIC1 = (1 << 14),
+  PTP_FLAG_SECURITY = (1 << 15),
 };
 
 // Not used currently
@@ -210,6 +207,72 @@ struct ptp_signaling_message
   uint8_t tlv_apple2[36];
 } __attribute__((packed));
 
+
+#define PTP_TLV_MIN_SIZE 4 // 2 bytes type + 2 bytes length
+#define PTP_TLV_ORG_CODE_SIZE 3
+#define PTP_TLV_ORG_EXTENSION 0x0003
+#define PTP_TLV_PATH_TRACE 0x0008
+
+enum ptp_tlv_org
+{
+  PTP_TLV_ORG_IEEE = 0,
+  PTP_TLV_ORG_APPLE = 1,
+};
+
+enum ptp_tlv_org_ieee_subtype
+{
+  PTP_TLV_ORG_IEEE_FOLLOW_UP_INFO = 0,
+  PTP_TLV_ORG_IEEE_MESSAGE_INTERNAL_REQUEST = 1,
+};
+
+enum ptp_tlv_org_apple_subtype
+{
+  PTP_TLV_ORG_APPLE_UNKNOWN1 = 0,
+  PTP_TLV_ORG_APPLE_CLOCK_ID = 1,
+  PTP_TLV_ORG_APPLE_UNKNOWN5 = 2,
+};
+
+struct ptp_tlv_org_subtype_map
+{
+  int index;
+  uint8_t code[PTP_TLV_ORG_CODE_SIZE];
+  char *name;
+  int (*handler)(const char *, struct ptp_tlv_org_subtype_map *, uint8_t *, size_t);
+};
+
+struct ptp_tlv_org_map
+{
+  enum ptp_tlv_org index;
+  uint8_t code[PTP_TLV_ORG_CODE_SIZE];
+  char *name;
+  struct ptp_tlv_org_subtype_map *subtypes;
+  int n_subtypes;
+};
+
+// Forward tlv handlers
+static int tlv_handle_org_subtype_generic(const char *, struct ptp_tlv_org_subtype_map *, uint8_t *, size_t);
+static int tlv_handle_org_subtype_message_internal(const char *, struct ptp_tlv_org_subtype_map *, uint8_t *, size_t);
+
+static struct ptp_tlv_org_subtype_map ptp_tlv_ieee_subtypes[] =
+{
+  { PTP_TLV_ORG_IEEE_FOLLOW_UP_INFO, { 0x00, 0x00, 0x01 }, "Follow_Up information TLV", tlv_handle_org_subtype_generic },
+  { PTP_TLV_ORG_IEEE_MESSAGE_INTERNAL_REQUEST, { 0x00, 0x00, 0x02 }, "Message internal request TLV", tlv_handle_org_subtype_message_internal },
+};
+
+static struct ptp_tlv_org_subtype_map ptp_tlv_apple_subtypes[] =
+{
+  { PTP_TLV_ORG_APPLE_UNKNOWN1, { 0x00, 0x00, 0x01 }, "Unknown subtype 1", tlv_handle_org_subtype_generic },
+  { PTP_TLV_ORG_APPLE_CLOCK_ID, { 0x00, 0x00, 0x04 }, "Clock ID TLV", tlv_handle_org_subtype_generic },
+  { PTP_TLV_ORG_APPLE_UNKNOWN5, { 0x00, 0x00, 0x05 }, "Unknown subtype 5", tlv_handle_org_subtype_generic },
+};
+
+static struct ptp_tlv_org_map ptp_tlv_orgs[] =
+{
+  { PTP_TLV_ORG_IEEE, { 0x00, 0x80, 0xc2 }, "IEEE 802.1 Chair", ptp_tlv_ieee_subtypes, ARRAY_SIZE(ptp_tlv_ieee_subtypes) },
+  { PTP_TLV_ORG_APPLE, { 0x00, 0x0d, 0x93 }, "Apple, Inc", ptp_tlv_apple_subtypes, ARRAY_SIZE(ptp_tlv_apple_subtypes) },
+};
+
+
 /* ========================= ptpd structs and globals  ====================== */
 
 struct ptpd_service
@@ -221,12 +284,11 @@ struct ptpd_service
 
 struct ptpd_slave
 {
-  uint16_t id;
+  uint32_t id;
   union net_sockaddr naddr;
   socklen_t naddr_len;
   char *str_addr; // Human readable for logging/debugging
   bool is_active;
-  time_t last_seen;
 };
 
 struct ptpd_state
@@ -234,6 +296,7 @@ struct ptpd_state
   bool is_running;
   pthread_t tid;
   struct event_base *evbase;
+  struct commands_base *cmdbase;
 
   struct ptpd_service event_svc;
   struct ptpd_service general_svc;
@@ -248,13 +311,13 @@ struct ptpd_state
 
   uint64_t clock_id;
   
-  pthread_mutex_t mutex;
   struct ptpd_slave slaves[PTPD_MAX_SLAVES];
   int num_slaves;
-  uint16_t last_slave_id;
 };
 
+// Daemon global state, incl. list of slaves
 static struct ptpd_state ptpd;
+
 static struct timeval ptpd_send_announce_tv =
 {
   .tv_sec = PTPD_INTERVAL_MS_ANNOUNCE / 1000,
@@ -270,6 +333,7 @@ static struct timeval ptpd_send_sync_tv =
   .tv_sec = PTPD_INTERVAL_MS_SYNC / 1000,
   .tv_usec = (PTPD_INTERVAL_MS_SYNC % 1000) * 1000
 };
+
 
 /* ================================= Helpers  =============================== */
 
@@ -523,8 +587,10 @@ msg_signaling_make(struct ptp_signaling_message *msg, uint64_t clock_id, uint16_
 {
   uint8_t apple_val1[sizeof(msg->tlv_apple1) - 4] = { 0 }; // 22 bytes
   uint8_t apple_val2[sizeof(msg->tlv_apple2) - 4] = { 0 }; // 32 bytes
+  uint8_t apple_unknown[4] = { 0x00, 0x00, 0x03, 0x01 };
   // iOS sets flags to 0x0408 -> UNICAST and TIMESCALE
   uint16_t flags = PTP_FLAG_UNICAST | PTP_FLAG_TIMESCALE;
+  uint8_t *ptr;
 
   header_init(&msg->header, PTP_MSGTYPE_SIGNALING, sizeof(struct ptp_signaling_message), clock_id, sequence_id, PTPD_LOGMESSAGEINT_SIGNALING, flags);
 
@@ -537,16 +603,22 @@ msg_signaling_make(struct ptp_signaling_message *msg, uint64_t clock_id, uint16_
 
   // TLV 1
   // Some fixed value, no clue what it means
-  apple_val1[0] = 0x00; apple_val1[1] = 0x0d; apple_val1[2] = 0x93; // Apple Org ID
-  apple_val1[3] = 0x00; apple_val1[4] = 0x00; apple_val1[5] = 0x01; // Org sub type, i.e. TLV type defined by Apple
-  apple_val1[8] = 0x03; apple_val1[9] = 0x01;
+  ptr = apple_val1;
+  memcpy(ptr, ptp_tlv_orgs[PTP_TLV_ORG_APPLE].code, PTP_TLV_ORG_CODE_SIZE);
+  ptr += PTP_TLV_ORG_CODE_SIZE;
+  memcpy(ptr, ptp_tlv_apple_subtypes[PTP_TLV_ORG_APPLE_UNKNOWN1].code, PTP_TLV_ORG_CODE_SIZE);
+  ptr += PTP_TLV_ORG_CODE_SIZE;
+  memcpy(ptr, apple_unknown, sizeof(apple_unknown));
   msg_tlv_write(msg->tlv_apple1, sizeof(msg->tlv_apple1), PTP_TLV_ORG_EXTENSION, sizeof(apple_val1), apple_val1);
 
   // TLV 2
-  // Some fixed value, no clue what it means
-  apple_val2[0] = 0x00; apple_val2[1] = 0x0d; apple_val2[2] = 0x93; // Apple Org ID
-  apple_val2[3] = 0x00; apple_val2[4] = 0x00; apple_val2[5] = 0x05; // Org sub type, i.e. TLV type defined by Apple
-  apple_val2[8] = 0x03; apple_val2[9] = 0x01;
+  // Same unknown value, but this is a longer field
+  ptr = apple_val2;
+  memcpy(ptr, ptp_tlv_orgs[PTP_TLV_ORG_APPLE].code, PTP_TLV_ORG_CODE_SIZE);
+  ptr += PTP_TLV_ORG_CODE_SIZE;
+  memcpy(ptr, ptp_tlv_apple_subtypes[PTP_TLV_ORG_APPLE_UNKNOWN5].code, PTP_TLV_ORG_CODE_SIZE);
+  ptr += PTP_TLV_ORG_CODE_SIZE;
+  memcpy(ptr, apple_unknown, sizeof(apple_unknown));
   msg_tlv_write(msg->tlv_apple2, sizeof(msg->tlv_apple2), PTP_TLV_ORG_EXTENSION, sizeof(apple_val2), apple_val2);
 }
 
@@ -569,6 +641,7 @@ msg_sync_follow_up_make(struct ptp_follow_up_message *msg, uint64_t clock_id, ui
   uint64_t be64_clock_id = htobe64(clock_id);
   // iOS sets flags to 0x0408 -> UNICAST and TIMESCALE
   uint16_t flags = PTP_FLAG_UNICAST | PTP_FLAG_TIMESCALE;
+  uint8_t *ptr;
 
   header_init(&msg->header, PTP_MSGTYPE_FOLLOW_UP, sizeof(struct ptp_follow_up_message), clock_id, sequence_id, PTPD_LOGMESSAGEINT_SYNC, flags);
 
@@ -591,15 +664,20 @@ msg_sync_follow_up_make(struct ptp_follow_up_message *msg, uint64_t clock_id, ui
   // 0xf9a33395 = -106744939 -> -106,744,939 / 2,199,023,255,552 = 0.000048 ns/s
   // We set zero because we have no idea if our rate is off from true time and
   // frankly don't care.
-  apple_val1[0] = 0x00; apple_val1[1] = 0x80; apple_val1[2] = 0xc2; // IEEE 802.1 Chair
-  apple_val1[3] = 0x00; apple_val1[4] = 0x00; apple_val1[5] = 0x01; // Follow_Up information TLV
+  ptr = apple_val1;
+  memcpy(ptr, ptp_tlv_orgs[PTP_TLV_ORG_IEEE].code, PTP_TLV_ORG_CODE_SIZE);
+  ptr += PTP_TLV_ORG_CODE_SIZE;
+  memcpy(ptr, ptp_tlv_ieee_subtypes[PTP_TLV_ORG_IEEE_FOLLOW_UP_INFO].code, PTP_TLV_ORG_CODE_SIZE);
   msg_tlv_write(msg->tlv_apple1, sizeof(msg->tlv_apple1), PTP_TLV_ORG_EXTENSION, sizeof(apple_val1), apple_val1);
 
   // TLV 2
   // Apple TLV with clock ID, who knows why
-  apple_val2[0] = 0x00; apple_val2[1] = 0x0d; apple_val2[2] = 0x93; // Apple Org ID
-  apple_val2[3] = 0x00; apple_val2[4] = 0x00; apple_val2[5] = 0x04; // Org sub type, i.e. TLV type defined by Apple
-  memcpy(apple_val2 + 6, &be64_clock_id, sizeof(be64_clock_id));
+  ptr = apple_val2;
+  memcpy(ptr, ptp_tlv_orgs[PTP_TLV_ORG_APPLE].code, PTP_TLV_ORG_CODE_SIZE);
+  ptr += PTP_TLV_ORG_CODE_SIZE;
+  memcpy(ptr, ptp_tlv_apple_subtypes[PTP_TLV_ORG_APPLE_CLOCK_ID].code, PTP_TLV_ORG_CODE_SIZE);
+  ptr += PTP_TLV_ORG_CODE_SIZE;
+  memcpy(ptr, &be64_clock_id, sizeof(be64_clock_id));
   msg_tlv_write(msg->tlv_apple2, sizeof(msg->tlv_apple2), PTP_TLV_ORG_EXTENSION, sizeof(apple_val2), apple_val2);
 }
 
@@ -646,220 +724,7 @@ msg_pdelay_resp_follow_up_make(struct ptp_pdelay_resp_follow_up_message *msg,
 }
 
 
-/* ============================= Slave handling ============================= */
-
-static void
-slave_clear(struct ptpd_slave *slave)
-{
-  free(slave->str_addr);
-  memset(slave, 0, sizeof(struct ptpd_slave));
-}
-
-// Called by e.g. player thread
-static int
-slave_add(struct ptpd_state *state, const char *addr)
-{
-  struct ptpd_slave *slave;
-  union net_sockaddr naddr;
-  uint16_t slave_id;
-  int ret;
-
-  ret = net_sockaddr_get(&naddr, addr, 0);
-  if (ret < 0)
-    {
-      DPRINTF(E_DBG, L_AIRPLAY, "Ignoring PTP peer address %s\n", addr);
-      return -1;
-    }
-
-  pthread_mutex_lock(&state->mutex);
-
-  if (state->num_slaves >= PTPD_MAX_SLAVES)
-    {
-      DPRINTF(E_LOG, L_AIRPLAY, "Max number of PTP slaves reached\n");
-      goto error;
-    }
-
-  // After UINT16_MAX slaves we will start reusing slave id's. We never use
-  // slave_id = 0.
-  slave_id = state->last_slave_id + 1;
-  if (slave_id == 0)
-    slave_id = 1;
-
-  slave = &state->slaves[state->num_slaves];
-  memset(slave, 0, sizeof(struct ptpd_slave));
-
-  slave->naddr_len = (naddr.sa.sa_family == AF_INET6) ? sizeof(naddr.sin6) : sizeof(naddr.sin);
-  memcpy(&slave->naddr, &naddr, slave->naddr_len);
-
-  slave->str_addr = strdup(addr);
-  slave->is_active = true;
-  slave->last_seen = time(NULL);
-  slave->id = slave_id;
-
-  state->num_slaves++;
-  state->last_slave_id = slave_id;
-
-  DPRINTF(E_DBG, L_AIRPLAY, "Added new slave with address %s\n", slave->str_addr);
-
-  pthread_mutex_unlock(&state->mutex);
-  return slave_id;
-
- error:
-  pthread_mutex_unlock(&state->mutex);
-  return -1;
-}
-
-// Called by e.g. player thread
-static void
-slave_remove(struct ptpd_state *state, int slave_id)
-{
-  struct ptpd_slave *slave;
-  bool found;
-  int i;
-
-  pthread_mutex_lock(&state->mutex);
-
-  for (i = 0, found = false; i < state->num_slaves; i++)
-    {
-      slave = &state->slaves[i];
-      if (!found && (slave_id == slave->id))
-	{
-	  slave_clear(slave);
-	  found = true;
-	  continue;
-	}
-
-      // Reorder the list
-      if (found)
-	state->slaves[i - 1] = *slave;
-    }
-
-  if (!found)
-    {
-      DPRINTF(E_DBG, L_AIRPLAY, "Can't remove PTP slave, not in our list\n");
-      goto error;
-    }
-
-  state->num_slaves--;
-
- error:
-  pthread_mutex_unlock(&state->mutex);
-  return;
-}
-
-static void
-slaves_prune(struct ptpd_state *state)
-{
-  struct ptpd_slave *slave;
-  int i;
-  int n_pruned;
-
-  pthread_mutex_lock(&state->mutex);
-
-  for (i = 0, n_pruned = 0; i < state->num_slaves; i++)
-    {
-      slave = &state->slaves[i];
-      if (!slave->is_active)
-	{
-	  slave_clear(slave);
-	  n_pruned++;
-	  continue;
-	}
-
-      if (n_pruned > 0)
-	state->slaves[i - n_pruned] = *slave;
-    }
-
-  state->num_slaves -= n_pruned;
-
-  pthread_mutex_unlock(&state->mutex);
-}
-
-static void
-slaves_msg_send(struct ptpd_state *state, void *msg, size_t msg_len, struct ptpd_service *svc)
-{
-  struct ptpd_slave *slave;
-  ssize_t len;
-  union net_sockaddr naddr;
-  uint8_t *msg_bin = msg;
-
-  pthread_mutex_lock(&state->mutex);
-
-  for (int i = 0; i < state->num_slaves; i++)
-    {
-      slave = &state->slaves[i];
-      if (!slave->is_active)
-	continue;
-
-      // Copy because we don't want to modify list elements, need them to be
-      // intact so we can recongnize them when asked to remove a slave
-      memcpy(&naddr, &slave->naddr, slave->naddr_len);
-
-      port_set(&naddr, svc->port);
-      len = sendto(svc->fd, msg, msg_len, 0, &naddr.sa, slave->naddr_len);
-      if (len < 0)
-	{
-	  DPRINTF(E_LOG, L_AIRPLAY, "Error sending PTP msg %02x to %s port %d\n", msg_bin[0], slave->str_addr, svc->port);
-	  slave->is_active = false; // Will be removed deferred by slaves_prune()
-	}
-      else if (len != msg_len)
-	DPRINTF(E_LOG, L_AIRPLAY, "Incomplete send of msg %02x to %s port %d\n", msg_bin[0], slave->str_addr, svc->port);
-      else
-	log_sent(msg_bin, svc->port);
-    }
-
-  pthread_mutex_unlock(&state->mutex);
-}
-
-
-/* =========================== Sending and dispatch ========================= */
-
-static void
-announce_send(struct ptpd_state *state)
-{
-  struct ptp_announce_message annnounce;
-  struct ptp_timestamp ts = { 0 };
-
-  // iOS just sends 0 as originTimestamp, we do the same
-  msg_announce_make(&annnounce, state->clock_id, state->announce_seq, ts);
-  slaves_msg_send(state, &annnounce, sizeof(annnounce), &state->general_svc);
-
-  state->announce_seq++;
-}
-
-static void
-signaling_send(struct ptpd_state *state)
-{
-  struct ptp_signaling_message signaling;
-
-  // TODO iOS sets targetPortIdentity, we probably also should
-  msg_signaling_make(&signaling, state->clock_id, state->signaling_seq, NULL);
-  slaves_msg_send(state, &signaling, sizeof(signaling), &state->general_svc);
-
-  state->signaling_seq++;
-}
-
-static void
-sync_send(struct ptpd_state *state)
-{
-  struct ptp_sync_message sync;
-  struct ptp_follow_up_message followup;
-  struct ptp_timestamp ts = { 0 };
-
-  // Two-step PTP seems to be a Sync with a 0 ts and then a Follow-Up with the
-  // ts of Sync
-  msg_sync_make(&sync, state->clock_id, state->sync_seq, ts);
-  ts = current_time_get();
-
-  slaves_msg_send(state, &sync, sizeof(sync), &state->event_svc);
-
-  // Send Follow Up with precise timestamp after a small delay
-  usleep(100);
-  msg_sync_follow_up_make(&followup, state->clock_id, state->sync_seq, ts);
-  slaves_msg_send(state, &followup, sizeof(followup), &state->general_svc);
-
-  state->sync_seq++;
-}
+/* ======================== Incoming message handling ======================= */
 
 static void
 sync_handle(struct ptpd_state *state, uint8_t *req, ssize_t req_len, union net_sockaddr *peer_addr, socklen_t peer_addr_len)
@@ -922,9 +787,13 @@ delay_req_handle(struct ptpd_state *state, uint8_t *req, ssize_t req_len, union 
   log_sent((uint8_t *)&delay_resp, PTPD_GENERAL_PORT);
 }
 
+// Since we are announcing ourselves as a very precise clock we always expect to
+// become master clock. Given that assumption holds true, we can just ignore
+// other announcements.
 static void
 announce_handle(struct ptpd_state *state, uint8_t *req, ssize_t req_len, union net_sockaddr *peer_addr, socklen_t peer_addr_len)
 {
+#if PTPD_LOG_RECEIVED
   struct ptp_announce_message *in = (struct ptp_announce_message *)req;
   struct ptp_announce_message announce = { 0 };
   uint64_t clock_id;
@@ -979,6 +848,7 @@ announce_handle(struct ptpd_state *state, uint8_t *req, ssize_t req_len, union n
     printf("  Time Source: 0x%02X (%s)\n", time_source, time_source_str);
     printf("  UTC Offset: %d seconds\n", utc_offset);
 */
+#endif
 }
 
 static void
@@ -1014,6 +884,308 @@ pdelay_req_handle(struct ptpd_state *state, uint8_t *req, ssize_t req_len, union
     DPRINTF(E_LOG, L_AIRPLAY, "Incomplete send of struct ptp_pdelay_resp_follow_up_message\n");
 
   log_sent((uint8_t *)&followup, PTPD_GENERAL_PORT);
+}
+
+static int
+tlv_handle_org_subtype_generic(const char *org, struct ptp_tlv_org_subtype_map *subtype, uint8_t *data, size_t len)
+{
+  DPRINTF(E_DBG, L_AIRPLAY, "Received '%s' TLV org extension, subtype '%s', length %zu\n", org, subtype->name, len);
+  return 0;
+}
+
+static int
+tlv_handle_org_subtype_message_internal(const char *org, struct ptp_tlv_org_subtype_map *subtype, uint8_t *data, size_t len)
+{
+  if (len < 6)
+    return -1;
+
+  DPRINTF(E_DBG, L_AIRPLAY, "Ignoring PTP signaling linkDelayInterval=%hhd, timeSyncInterval=%hhd, announceInterval=%hhd\n", data[0], data[1], data[2]);
+  return 0;
+}
+
+static int
+tlv_handle_org_extension(uint8_t *data, uint16_t len)
+{
+  uint8_t orgcode[PTP_TLV_ORG_CODE_SIZE];
+  uint8_t subtype[PTP_TLV_ORG_CODE_SIZE];
+  uint16_t offset = sizeof(orgcode) + sizeof(subtype);
+  struct ptp_tlv_org_map *org;
+
+  if (len < offset)
+    return -1;
+
+  memcpy(orgcode, data, PTP_TLV_ORG_CODE_SIZE);
+  memcpy(subtype, data + PTP_TLV_ORG_CODE_SIZE, PTP_TLV_ORG_CODE_SIZE);
+
+  for (int i = 0; i < ARRAY_SIZE(ptp_tlv_orgs); i++)
+    {
+      org = &ptp_tlv_orgs[i];
+
+      if (memcmp(orgcode, org->code, PTP_TLV_ORG_CODE_SIZE) != 0)
+	continue;
+
+      for (int j = 0; j < org->n_subtypes; j++)
+	{
+	  if (memcmp(subtype, org->subtypes[j].code, PTP_TLV_ORG_CODE_SIZE) != 0)
+	    continue;
+
+	  return org->subtypes[j].handler(org->name, &org->subtypes[j], data + offset, len - offset);
+	}
+    }
+
+  return -1;
+}
+
+static int
+tlv_handle_path_trace(uint8_t *data, uint16_t len)
+{
+  // Normally we get the 8 byte clock ID here, log if something unexpected
+  if (len != 8)
+    DHEXDUMP(E_WARN, L_AIRPLAY, data, len, "TLV path trace with unexpected length\n");
+
+  return 0;
+}
+
+// Returns length of tlv consumed (0 if no tlv), negative if error
+static ssize_t
+tlv_handle(uint8_t *tlv, ssize_t tlv_max_size)
+{
+  uint8_t *ptr = tlv;
+  uint16_t be16;
+  uint16_t type;
+  uint16_t len;
+  int ret;
+
+  if (tlv_max_size == 0)
+    return 0;
+  else if (tlv_max_size < PTP_TLV_MIN_SIZE)
+    return -1;
+
+  memcpy(&be16, ptr, sizeof(be16));
+  ptr += sizeof(be16);
+  type = be16toh(be16);
+
+  memcpy(&be16, ptr, sizeof(be16));
+  ptr += sizeof(be16);
+  len = be16toh(be16);
+
+  if (tlv_max_size < PTP_TLV_MIN_SIZE + len)
+    return -1;
+
+  if (type == PTP_TLV_ORG_EXTENSION)
+    ret = tlv_handle_org_extension(ptr, len);
+  else if (type == PTP_TLV_PATH_TRACE)
+    ret = tlv_handle_path_trace(ptr, len);
+  else
+    ret = -1;
+
+  return (ret < 0) ? ret : PTP_TLV_MIN_SIZE + len;
+}
+
+static void
+signaling_handle(struct ptpd_state *state, uint8_t *req, ssize_t req_len, union net_sockaddr *peer_addr, socklen_t peer_addr_len)
+{
+  // 34 bytes header and then 10 bytes targetPortIdentity
+  size_t tlv_offset = sizeof(struct ptp_header) + PTP_PORT_ID_SIZE;
+  ssize_t req_remaining = req_len - tlv_offset;
+  ssize_t tlv_size;
+
+  while ((tlv_size = tlv_handle(req + tlv_offset, req_remaining)) > 0)
+    {
+      req_remaining -= tlv_size;
+      tlv_offset += tlv_size;
+    }
+
+  if (tlv_size < 0)
+    DHEXDUMP(E_WARN, L_AIRPLAY, req, req_len, "Received invalid or unknown PTP_MSGTYPE_SIGNALING\n");
+}
+
+static void
+management_handle(struct ptpd_state *state, uint8_t *req, ssize_t req_len, union net_sockaddr *peer_addr, socklen_t peer_addr_len)
+{
+  DHEXDUMP(E_DBG, L_AIRPLAY, req, req_len, "Received PTP_MSGTYPE_MANAGEMENT\n");
+}
+
+
+/* ============================= Slave handling ============================= */
+
+static void
+slave_clear(struct ptpd_slave *slave)
+{
+  free(slave->str_addr);
+  memset(slave, 0, sizeof(struct ptpd_slave));
+}
+
+static void
+slaves_prune(struct ptpd_state *state)
+{
+  struct ptpd_slave *slave;
+  int i;
+  int n_pruned;
+
+  for (i = 0, n_pruned = 0; i < state->num_slaves; i++)
+    {
+      slave = &state->slaves[i];
+      if (!slave->is_active)
+	{
+	  slave_clear(slave);
+	  n_pruned++;
+	  continue;
+	}
+
+      if (n_pruned > 0)
+	state->slaves[i - n_pruned] = *slave;
+    }
+
+  state->num_slaves -= n_pruned;
+}
+
+static enum command_state
+slave_add(void *arg, int *ret)
+{
+  struct ptpd_state *state = &ptpd;
+  struct ptpd_slave *slave = arg;
+
+  // Clean up dead slaves
+  slaves_prune(state);
+
+  if (state->num_slaves >= PTPD_MAX_SLAVES)
+    {
+      DPRINTF(E_LOG, L_AIRPLAY, "Max number of PTP slaves reached\n");
+      return COMMAND_END;
+    }
+
+  DPRINTF(E_DBG, L_AIRPLAY, "Adding new slave with address %s\n", slave->str_addr);
+
+  slave->is_active = true;
+  memcpy(&state->slaves[state->num_slaves], slave, sizeof(struct ptpd_slave));
+  state->num_slaves++;
+
+  // Trigger announce and signaling immediately
+  event_active(state->send_announce_timer, 0, 0);
+  event_active(state->send_signaling_timer, 0, 0);
+
+  // We should send sync's at specific interval, so if already running don't
+  // disturb the rhythm. I.e. only trigger if not running already.
+  if (!event_pending(state->send_sync_timer, EV_TIMEOUT, NULL))
+    event_add(state->send_sync_timer, &ptpd_send_sync_tv);
+
+  return COMMAND_END;
+}
+
+static enum command_state
+slave_remove(void *arg, int *ret)
+{
+  struct ptpd_state *state = &ptpd;
+  struct ptpd_slave *slave = arg;
+  uint32_t slave_id = slave->id;
+  bool found;
+  int i;
+
+  for (i = 0, found = false; i < state->num_slaves; i++)
+    {
+      slave = &state->slaves[i];
+      if (!found && (slave_id == slave->id))
+	{
+	  slave_clear(slave);
+	  found = true;
+	  continue;
+	}
+
+      // Make sure the list is sequential
+      if (found)
+	state->slaves[i - 1] = *slave;
+    }
+
+  if (!found)
+    {
+      DPRINTF(E_DBG, L_AIRPLAY, "Can't remove PTP slave, not in our list\n");
+      return COMMAND_END;
+    }
+
+  state->num_slaves--;
+
+  return COMMAND_END;
+}
+
+static void
+slaves_msg_send(struct ptpd_state *state, void *msg, size_t msg_len, struct ptpd_service *svc)
+{
+  struct ptpd_slave *slave;
+  ssize_t len;
+  union net_sockaddr naddr;
+  uint8_t *msg_bin = msg;
+
+  for (int i = 0; i < state->num_slaves; i++)
+    {
+      slave = &state->slaves[i];
+      if (!slave->is_active)
+	continue;
+
+      // Copy because we don't want to modify list elements
+      memcpy(&naddr, &slave->naddr, slave->naddr_len);
+
+      port_set(&naddr, svc->port);
+      len = sendto(svc->fd, msg, msg_len, 0, &naddr.sa, slave->naddr_len);
+      if (len < 0)
+	{
+	  DPRINTF(E_LOG, L_AIRPLAY, "Error sending PTP msg %02x to %s port %d\n", msg_bin[0], slave->str_addr, svc->port);
+	  slave->is_active = false; // Will be removed deferred by slaves_prune()
+	}
+      else if (len != msg_len)
+	DPRINTF(E_LOG, L_AIRPLAY, "Incomplete send of msg %02x to %s port %d\n", msg_bin[0], slave->str_addr, svc->port);
+      else
+	log_sent(msg_bin, svc->port);
+    }
+}
+
+
+/* =========================== Sending and dispatch ========================= */
+
+static void
+announce_send(struct ptpd_state *state)
+{
+  struct ptp_announce_message annnounce;
+  struct ptp_timestamp ts = { 0 };
+
+  // iOS just sends 0 as originTimestamp, we do the same
+  msg_announce_make(&annnounce, state->clock_id, state->announce_seq, ts);
+  slaves_msg_send(state, &annnounce, sizeof(annnounce), &state->general_svc);
+
+  state->announce_seq++;
+}
+
+static void
+signaling_send(struct ptpd_state *state)
+{
+  struct ptp_signaling_message signaling;
+
+  // TODO iOS sets targetPortIdentity, we probably also should
+  msg_signaling_make(&signaling, state->clock_id, state->signaling_seq, NULL);
+  slaves_msg_send(state, &signaling, sizeof(signaling), &state->general_svc);
+
+  state->signaling_seq++;
+}
+
+static void
+sync_send(struct ptpd_state *state)
+{
+  struct ptp_sync_message sync;
+  struct ptp_follow_up_message followup;
+  struct ptp_timestamp ts = { 0 };
+
+  // Two-step PTP is a Sync with a 0 ts and then a Follow-Up with the ts of Sync
+  msg_sync_make(&sync, state->clock_id, state->sync_seq, ts);
+  ts = current_time_get();
+
+  slaves_msg_send(state, &sync, sizeof(sync), &state->event_svc);
+
+  // Send Follow Up with precise timestamp after a small delay
+  usleep(100);
+  msg_sync_follow_up_make(&followup, state->clock_id, state->sync_seq, ts);
+  slaves_msg_send(state, &followup, sizeof(followup), &state->general_svc);
+
+  state->sync_seq++;
 }
 
 static void
@@ -1092,6 +1264,12 @@ ptpd_respond_cb(int fd, short what, void *arg)
 	break;
       case PTP_MSGTYPE_PDELAY_REQ:
 	pdelay_req_handle(state, req, len, &peer_addr, peer_addrlen);
+	break;
+      case PTP_MSGTYPE_SIGNALING:
+	signaling_handle(state, req, len, &peer_addr, peer_addrlen);
+	break;
+      case PTP_MSGTYPE_MANAGEMENT:
+	management_handle(state, req, len, &peer_addr, peer_addrlen);
 	break;
       default:
 	DPRINTF(E_DBG, L_AIRPLAY, "Service %s received unhandled message type: %02x\n", svc_name, msg_type);
@@ -1188,43 +1366,54 @@ ptpd_clock_id_get(void)
   return ptpd.clock_id;
 }
 
-// TODO uses mutex where the other thread does send i/o, so risk of blocking player thread!
+// Thread: player (must not block!)
 int
-ptpd_slave_add(const char *addr)
+ptpd_slave_add(uint32_t *slave_id, const char *addr)
 {
-  int slave_id;
+  struct ptpd_slave *slave;
 
   if (!ptpd.is_running)
     return -1;
 
-  // Now is a good time to kill non-working slaves
-  slaves_prune(&ptpd);
+  CHECK_NULL(L_AIRPLAY, slave = calloc(1, sizeof(struct ptpd_slave)));
 
-  slave_id = slave_add(&ptpd, addr);
-  if (slave_id < 0)
-    return -1;
+  if (net_sockaddr_get(&slave->naddr, addr, 0) < 0)
+    {
+      DPRINTF(E_DBG, L_AIRPLAY, "Ignoring PTP address %s\n", addr);
+      free(slave);
+      return -1;
+    }
 
-  // Trigger announce and signaling immediately
-  event_active(ptpd.send_announce_timer, 0, 0);
-  event_active(ptpd.send_signaling_timer, 0, 0);
+  slave->id = djb_hash(addr, strlen(addr));
+  slave->naddr_len = (slave->naddr.sa.sa_family == AF_INET6) ? sizeof(slave->naddr.sin6) : sizeof(slave->naddr.sin);
+  slave->str_addr = strdup(addr);
 
-  // We should send sync's at specific interval, so if already running don't
-  // disturb the rhythm. I.e. only trigger if not running already.
-  if (!event_pending(ptpd.send_sync_timer, EV_TIMEOUT, NULL))
-    event_add(ptpd.send_sync_timer, &ptpd_send_sync_tv);
+  *slave_id = slave->id;
 
-  return slave_id;
+  commands_exec_async(ptpd.cmdbase, slave_add, slave);
+  return 0;
 }
 
+// Thread: player (must not block!)
 void
-ptpd_slave_remove(int slave_id)
+ptpd_slave_remove(uint32_t slave_id)
 {
-  if (!ptpd.is_running || slave_id == 0)
+  struct ptpd_slave *slave;
+
+  if (!ptpd.is_running)
     return;
 
-  slave_remove(&ptpd, slave_id);
+  if (slave_id == 0)
+    return;
+
+  CHECK_NULL(L_AIRPLAY, slave = calloc(1, sizeof(struct ptpd_slave)));
+
+  slave->id = slave_id;
+
+  commands_exec_async(ptpd.cmdbase, slave_remove, slave);
 }
 
+// Thread: main (with root priviliges)
 int
 ptpd_bind(void)
 {
@@ -1248,15 +1437,23 @@ ptpd_bind(void)
   return -1;
 }
 
+// Thread: main (normal priviliges)
 int
 ptpd_init(uint64_t clock_id_seed)
 {
-  int ret;
+  int i;
 
+  // Check alignment of enum and array indices
+  for (i = 0; i < ARRAY_SIZE(ptp_tlv_orgs); i++)
+    assert(ptp_tlv_orgs[i].index == i);
+  for (i = 0; i < ARRAY_SIZE(ptp_tlv_apple_subtypes); i++)
+    assert(ptp_tlv_apple_subtypes[i].index == i);
+  for (i = 0; i < ARRAY_SIZE(ptp_tlv_ieee_subtypes); i++)
+    assert(ptp_tlv_ieee_subtypes[i].index == i);
+
+  // No point in starting if ptpd_bind() failed
   if (ptpd.event_svc.fd < 0 || ptpd.general_svc.fd < 0)
     return -1;
-
-  CHECK_NULL(L_AIRPLAY, ptpd.evbase = event_base_new());
 
   // From IEEE EUI-64 clockIdentity values: "The most significant 3 octets of
   // the clockIdentity shall be an OUI. The least significant two bits of the
@@ -1269,16 +1466,14 @@ ptpd_init(uint64_t clock_id_seed)
   // create a non-EUI-64 clock ID from 0xFFFF + 6 byte seed, ref 7.5.2.2.3.
   ptpd.clock_id = clock_id_seed | 0xFFFF000000000000;
 
-  ret = pthread_create(&ptpd.tid, NULL, run, &ptpd);
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_AIRPLAY, "Could not spawn ptpd thread: %s\n", strerror(errno));
-      return -1;
-    }
+  CHECK_NULL(L_AIRPLAY, ptpd.evbase = event_base_new());
+  CHECK_NULL(L_AIRPLAY, ptpd.cmdbase = commands_base_new(ptpd.evbase, NULL));
+  CHECK_ERR(L_AIRPLAY, pthread_create(&ptpd.tid, NULL, run, &ptpd));
 
   return 0;
 }
 
+// Thread: main (normal priviliges)
 void
 ptpd_deinit(void)
 {
@@ -1286,7 +1481,7 @@ ptpd_deinit(void)
 
   ptpd.is_running = false;
 
-  event_base_loopbreak(ptpd.evbase);
+  commands_base_destroy(ptpd.cmdbase);
 
   ret = pthread_join(ptpd.tid, NULL);
   if (ret != 0)
