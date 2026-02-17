@@ -2964,7 +2964,7 @@ packets_send(struct raop_master_session *rms)
       return -1;
     }
 
-  pkt = rtp_packet_next(rms->rtp_session, len, rms->samples_per_packet, RAOP_RTP_PAYLOADTYPE, 0);
+  pkt = rtp_packet_next(rms->rtp_session, len, rms->samples_per_packet, RAOP_RTP_PAYLOADTYPE);
 
   evbuffer_remove(rms->encoded_buffer, pkt->payload, pkt->payload_len);
 
@@ -2983,12 +2983,12 @@ packets_send(struct raop_master_session *rms)
       // Device just joined
       if (rs->state == RAOP_STATE_CONNECTED)
 	{
-	  pkt->header[1] = 0xe0;
+	  pkt->header[1] |= RTP_MARKER_BIT; // Set marker bit, value becomes 0xe0
 	  packet_send(rs, pkt);
+	  pkt->header[1] &= ~RTP_MARKER_BIT; // Clear marker bit
 	}
       else if (rs->state == RAOP_STATE_STREAMING)
 	{
-	  pkt->header[1] = 0x60;
 	  packet_send(rs, pkt);
 	}
     }
@@ -3065,7 +3065,7 @@ packets_sync_send(struct raop_master_session *rms)
       // A device has joined and should get an init sync packet
       if (rs->state == RAOP_STATE_CONNECTED)
 	{
-	  sync_pkt = rtp_sync_packet_next(rms->rtp_session, cur_stamp, 0x90, false);
+	  sync_pkt = rtp_sync_packet_next(rms->rtp_session, cur_stamp, 0x90);
 	  control_packet_send(rs, sync_pkt);
 
 	  DPRINTF(E_DBG, L_RAOP, "Start sync packet sent to '%s': offset=%d, cur_pos=%" PRIu32 ", cur_ts=%ld.%09ld, clock=%ld.%09ld, rtptime=%" PRIu32 "\n",
@@ -3073,7 +3073,7 @@ packets_sync_send(struct raop_master_session *rms)
 	}
       else if (is_sync_time && rs->state == RAOP_STATE_STREAMING)
 	{
-	  sync_pkt = rtp_sync_packet_next(rms->rtp_session, cur_stamp, 0x80, false);
+	  sync_pkt = rtp_sync_packet_next(rms->rtp_session, cur_stamp, 0x80);
 	  control_packet_send(rs, sync_pkt);
 	}
     }

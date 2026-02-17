@@ -225,7 +225,9 @@ struct airplay_master_session
   size_t rawbuf_size;
   uint32_t samples_per_packet;
 
+  // Session characteristics
   struct media_quality quality;
+  bool use_ptp;
 
   // Number of samples that we tell the output to buffer (this will mean that
   // the position that we send in the sync packages are offset by this amount
@@ -252,7 +254,6 @@ struct airplay_session
   uint16_t wanted_metadata;
   bool req_has_auth;
   bool supports_auth_setup;
-  bool use_ptp;
 
   struct event *deferredev;
 
@@ -1139,7 +1140,7 @@ master_session_cleanup(struct airplay_master_session *rms)
 }
 
 static struct airplay_master_session *
-master_session_make(struct media_quality *quality)
+master_session_make(struct media_quality *quality, bool use_ptp)
 {
   struct airplay_master_session *rms;
   uint64_t buffer_duration_ms;
@@ -1150,7 +1151,7 @@ master_session_make(struct media_quality *quality)
   // First check if we already have a suitable session
   for (rms = airplay_master_sessions; rms; rms = rms->next)
     {
-      if (quality_is_equal(quality, &rms->rtp_session->quality))
+      if (quality_is_equal(quality, &rms->rtp_session->quality) && use_ptp == rms->use_ptp)
 	return rms;
     }
 
@@ -1164,7 +1165,7 @@ master_session_make(struct media_quality *quality)
 
   CHECK_NULL(L_AIRPLAY, rms = calloc(1, sizeof(struct airplay_master_session)));
 
-  clock_id = ptpd_clock_id_get();
+  clock_id = use_ptp ? ptpd_clock_id_get() : 0;
 
   rms->rtp_session = rtp_session_new(quality, AIRPLAY_PACKET_BUFFER_SIZE, 0, clock_id);
   if (!rms->rtp_session)
@@ -1195,6 +1196,7 @@ master_session_make(struct media_quality *quality)
     }
 
   rms->quality = *quality;
+  rms->use_ptp = use_ptp;
   rms->samples_per_packet = AIRPLAY_SAMPLES_PER_PACKET;
   rms->rawbuf_size = STOB(rms->samples_per_packet, quality->bits_per_sample, quality->channels);
   rms->output_buffer_samples = (buffer_duration_ms - AIRPLAY_AUDIO_LATENCY_MS) * quality->sample_rate / 1000;
@@ -1602,7 +1604,6 @@ session_make(struct output_device *rd, int callback_id)
 
   rs->supports_auth_setup = re->supports_auth_setup;
   rs->wanted_metadata = re->wanted_metadata;
-  rs->use_ptp = re->use_ptp;
 
   rs->next_seq = AIRPLAY_SEQ_CONTINUE;
 
@@ -1617,7 +1618,7 @@ session_make(struct output_device *rd, int callback_id)
 	goto error;
     }
 
-  rs->master_session = master_session_make(&rd->quality);
+  rs->master_session = master_session_make(&rd->quality, re->use_ptp);
   if (!rs->master_session)
     {
       DPRINTF(E_LOG, L_AIRPLAY, "Could not attach a master session for device '%s'\n", rd->name);
@@ -2067,7 +2068,7 @@ packets_send(struct airplay_master_session *rms)
   if (len < 0)
     return -1;
 
-  pkt = rtp_packet_next(rms->rtp_session, len, rms->samples_per_packet, AIRPLAY_RTP_PAYLOADTYPE, 0);
+  pkt = rtp_packet_next(rms->rtp_session, len, rms->samples_per_packet, AIRPLAY_RTP_PAYLOADTYPE);
 
   evbuffer_remove(rms->encoded_buffer, pkt->payload, pkt->payload_len);
 
@@ -2079,12 +2080,12 @@ packets_send(struct airplay_master_session *rms)
       // Device just joined
       if (rs->state == AIRPLAY_STATE_CONNECTED)
 	{
-	  pkt->header[1] = AIRPLAY_RTP_PAYLOADTYPE;
+	  pkt->header[1] |= RTP_MARKER_BIT; // Set marker bit, value becomes 0xe0
 	  packet_send(rs, pkt);
+	  pkt->header[1] &= ~RTP_MARKER_BIT; // Clear marker bit
 	}
       else if (rs->state == AIRPLAY_STATE_STREAMING)
 	{
-	  pkt->header[1] = AIRPLAY_RTP_PAYLOADTYPE;
 	  packet_send(rs, pkt);
 	}
     }
@@ -2161,15 +2162,16 @@ packets_sync_send(struct airplay_master_session *rms)
       // A device has joined and should get an init sync packet
       if (rs->state == AIRPLAY_STATE_CONNECTED)
 	{
-	  sync_pkt = rtp_sync_packet_next(rms->rtp_session, cur_stamp, 0x90, rs->use_ptp);
+	  sync_pkt = rtp_sync_packet_next(rms->rtp_session, cur_stamp, 0x90);
 	  control_packet_send(rs, sync_pkt);
 
-	  DPRINTF(E_DBG, L_AIRPLAY, "Start sync packet sent to '%s': offset=%d, cur_pos=%" PRIu32 ", cur_ts=%ld.%09ld, clock=%ld.%09ld, rtptime=%" PRIu32 "\n",
-	    rs->devname, rs->offset_samples, cur_stamp.pos, (long)cur_stamp.ts.tv_sec, (long)cur_stamp.ts.tv_nsec, (long)ts.tv_sec, (long)ts.tv_nsec, rms->rtp_session->pos);
+	  DPRINTF(E_DBG, L_AIRPLAY, "Start sync packet sent to '%s': offset=%d, cur_pos=%" PRIu32 ", cur_ts=%ld.%09ld, clock=%ld.%09ld, rtptime=%" PRIu32 ", timing=%s\n",
+	    rs->devname, rs->offset_samples, cur_stamp.pos, (long)cur_stamp.ts.tv_sec, (long)cur_stamp.ts.tv_nsec, (long)ts.tv_sec, (long)ts.tv_nsec,
+	    rms->rtp_session->pos, rms->use_ptp ? "PTP" : "NTP");
 	}
       else if (is_sync_time && rs->state == AIRPLAY_STATE_STREAMING)
 	{
-	  sync_pkt = rtp_sync_packet_next(rms->rtp_session, cur_stamp, 0x80, rs->use_ptp);
+	  sync_pkt = rtp_sync_packet_next(rms->rtp_session, cur_stamp, 0x80);
 	  control_packet_send(rs, sync_pkt);
 	}
     }
@@ -2736,7 +2738,7 @@ payload_make_setup_session_ptp(struct evrtsp_request *req, struct airplay_sessio
 static int
 payload_make_setup_session(struct evrtsp_request *req, struct airplay_session *rs, void *arg)
 {
-  if (!rs->use_ptp)
+  if (!rs->master_session->use_ptp)
     return payload_make_setup_session_ntp(req, rs, arg);
 
   return payload_make_setup_session_ptp(req, rs, arg);
@@ -3169,7 +3171,7 @@ response_handler_setup_session(struct evrtsp_request *req, struct airplay_sessio
       DPRINTF(E_WARN, L_AIRPLAY, "Could not connect to '%s' events port %u, proceeding anyway\n", rs->devname, rs->events_port);
     }
 
-  if (rs->use_ptp)
+  if (rs->master_session->use_ptp)
     {
       ret = handle_timingpeerinfo(&rs->ptpd_slave_id, response);
       if (ret < 0)

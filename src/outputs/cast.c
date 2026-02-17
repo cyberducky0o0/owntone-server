@@ -968,7 +968,7 @@ packet_make(struct cast_master_session *cms)
     return -1;
 
   // For audio it is always a complete frame, so marker bit is 1 (like Chromium does)
-  pkt = rtp_packet_next(cms->rtp_session, CAST_HEADER_SIZE + len, cms->samples_per_packet, CAST_RTP_PAYLOADTYPE_AUDIO, 1);
+  pkt = rtp_packet_next(cms->rtp_session, CAST_HEADER_SIZE + len, cms->samples_per_packet, CAST_RTP_PAYLOADTYPE_AUDIO | RTP_MARKER_BIT);
 
   // Creates Cast header + adds payload
   ret = packet_prepare(pkt, cast_encoded_data);
@@ -2347,7 +2347,7 @@ cast_metadata_send(struct output_metadata *metadata)
 	continue;
 
       // Marker bit is 1 because we send a complete frame
-      pkt = rtp_packet_next(cs->master_session->rtp_artwork, CAST_HEADER_SIZE + artwork_size, 1, CAST_RTP_PAYLOADTYPE_VIDEO, 1);
+      pkt = rtp_packet_next(cs->master_session->rtp_artwork, CAST_HEADER_SIZE + artwork_size, 1, CAST_RTP_PAYLOADTYPE_VIDEO | RTP_MARKER_BIT);
       if (!pkt)
 	continue;
 

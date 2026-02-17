@@ -75,7 +75,7 @@ rtp_session_new(struct media_quality *quality, int pktbuf_size, int sync_each_ns
   gcry_randomize(&session->pos, sizeof(session->pos), GCRY_STRONG_RANDOM);
   gcry_randomize(&session->seqnum, sizeof(session->seqnum), GCRY_STRONG_RANDOM);
 
-  // Apple seems to have ssrc_id = 0 when using ptp
+  // ssrc_id is zero if it's a ptp session
   if (ptp_clock_id)
     session->ptp_clock_id = ptp_clock_id;
   else
@@ -118,7 +118,7 @@ rtp_session_flush(struct rtp_session *session)
 // We don't want the caller to malloc payload for every packet, so instead we
 // will get him a packet from the ring buffer, thus in most cases reusing memory
 struct rtp_packet *
-rtp_packet_next(struct rtp_session *session, size_t payload_len, int samples, char payload_type, char marker_bit)
+rtp_packet_next(struct rtp_session *session, size_t payload_len, int samples, char payload_type)
 {
   struct rtp_packet *pkt;
   uint16_t seq;
@@ -159,7 +159,7 @@ rtp_packet_next(struct rtp_session *session, size_t payload_len, int samples, ch
   //   |           synchronization source (SSRC) identifier            |
   //   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
   pkt->header[0] = 0x80; // Version = 2, P, X and CC are 0
-  pkt->header[1] = payload_type;
+  pkt->header[1] = payload_type; // M and payload type
 
   seq = htobe16(session->seqnum);
   memcpy(pkt->header + 2, &seq, 2);
@@ -256,7 +256,7 @@ rtp_sync_is_time(struct rtp_session *session)
 //   |                                                               |
 //   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 static void
-sync_packet_ptp_make(uint8_t *data, size_t *data_len, struct rtcp_timestamp cur_stamp, uint32_t pos, char type, uint64_t ptp_clock_id)
+sync_packet_ptp_make(uint8_t *data, struct rtcp_timestamp cur_stamp, uint32_t pos, char type, uint64_t ptp_clock_id)
 {
   uint32_t cur_pos;
   uint64_t cur_ns;
@@ -283,8 +283,6 @@ sync_packet_ptp_make(uint8_t *data, size_t *data_len, struct rtcp_timestamp cur_
 
   clock_id = htobe64(ptp_clock_id);
   memcpy(data + 20, &clock_id, 8);
-
-  *data_len = RTCP_SYNC_PACKET_PTP_LEN;
 }
 
 // Example first raw packet, Apple Music, AirPlay 1 (20 bytes)
@@ -303,7 +301,7 @@ sync_packet_ptp_make(uint8_t *data, size_t *data_len, struct rtcp_timestamp cur_
 //   |                     rtptime of first packet                   |
 //   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 static void
-sync_packet_ntp_make(uint8_t *data, size_t *data_len, struct rtcp_timestamp cur_stamp, uint32_t pos, char type)
+sync_packet_ntp_make(uint8_t *data, struct rtcp_timestamp cur_stamp, uint32_t pos, char type)
 {
   struct ntp_timestamp cur_ts;
   uint32_t rtptime;
@@ -336,27 +334,25 @@ sync_packet_ntp_make(uint8_t *data, size_t *data_len, struct rtcp_timestamp cur_
 
   rtptime = htobe32(pos + 11025); // Latency matching the above 0x07
   memcpy(data + 16, &rtptime, 4);
-
-  *data_len = RTCP_SYNC_PACKET_NTP_LEN;
 }
 
 struct rtp_packet *
-rtp_sync_packet_next(struct rtp_session *session, struct rtcp_timestamp cur_stamp, char type, bool use_ptp)
+rtp_sync_packet_next(struct rtp_session *session, struct rtcp_timestamp cur_stamp, char type)
 {
   struct rtp_packet *pkt = &session->sync_packet_next;
 
   // One-off allocation of some permanent space for the packet data
   if (!pkt->data)
     {
-      pkt->data_size = MAX(RTCP_SYNC_PACKET_PTP_LEN, RTCP_SYNC_PACKET_NTP_LEN);
+      pkt->data_size = session->ptp_clock_id ? RTCP_SYNC_PACKET_PTP_LEN : RTCP_SYNC_PACKET_NTP_LEN;
+      pkt->data_len = pkt->data_size;
       CHECK_NULL(L_PLAYER, pkt->data = malloc(pkt->data_size));
     }
 
-  pkt->data_len = pkt->data_size;
-  if (use_ptp)
-    sync_packet_ptp_make(pkt->data, &pkt->data_len, cur_stamp, session->pos, type, session->ptp_clock_id);
+  if (session->ptp_clock_id)
+    sync_packet_ptp_make(pkt->data, cur_stamp, session->pos, type, session->ptp_clock_id);
   else
-    sync_packet_ntp_make(pkt->data, &pkt->data_len, cur_stamp, session->pos, type);
+    sync_packet_ntp_make(pkt->data, cur_stamp, session->pos, type);
 
   return pkt;
 }
