@@ -2248,8 +2248,7 @@ timing_svc_cb(int fd, short what, void *arg)
   ret = recvfrom(svc->fd, req, sizeof(req), 0, &peer_addr.sa, &peer_addrlen);
   if (ret < 0)
     {
-      net_address_get(address, sizeof(address), &peer_addr);
-      DPRINTF(E_LOG, L_AIRPLAY, "Error reading timing request from %s: %s\n", address, strerror(errno));
+      DPRINTF(E_LOG, L_AIRPLAY, "Error reading timing request: %s\n", strerror(errno));
       return;
     }
 

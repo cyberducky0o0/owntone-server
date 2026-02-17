@@ -1238,8 +1238,12 @@ ptpd_respond_cb(int fd, short what, void *arg)
   uint8_t msg_type;
   ssize_t len;
 
+  // Shouldn't be necessary, but silences scan-build complaint about sa_family
+  // possibly being garbage after recvfrom()
+  peer_addr.sa.sa_family = AF_UNSPEC;
+
   len = recvfrom(fd, req, sizeof(req), 0, &peer_addr.sa, &peer_addrlen);
-  if (len <= 0)
+  if (len <= 0 || peer_addr.sa.sa_family == AF_UNSPEC)
     {
       if (len < 0)
 	DPRINTF(E_LOG, L_AIRPLAY, "Service %s read error: %s\n", svc_name, strerror(errno));
